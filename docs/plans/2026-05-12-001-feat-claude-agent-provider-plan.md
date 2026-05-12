@@ -3,6 +3,7 @@ title: "feat: Add :claude_agent provider backed by the Claude Code CLI"
 type: feat
 status: active
 created: 2026-05-12
+deepened: 2026-05-12
 depth: deep
 ---
 
@@ -131,19 +132,18 @@ The CLI emits one JSON object per line over stdout. Observed event shapes that t
 
 | Event type | Source | Provider response |
 |---|---|---|
-| `{"type":"system","subtype":"init", …, "session_id":"…", "model":"…", "tools":[…]}` | Per session | Capture `session_id` into stream metadata; ignore tools list (informational) |
-| `{"type":"system","subtype":"status", "status":"requesting"}` | Status pings | Ignore (informational) |
-| `{"type":"rate_limit_event", "rate_limit_info":{…}}` | Per turn | Surface into stream metadata under `:rate_limit` |
-| `{"type":"stream_event","event":{"type":"message_start", …}}` | Token-level (only with `--include-partial-messages`) | Forward `event` payload to `Anthropic.Response.decode_stream_event/3` |
-| `{"type":"stream_event","event":{"type":"content_block_start", …}}` | Token-level | Same |
-| `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}}` | Token-level | Same → emits `StreamChunk.text(...)` |
-| `{"type":"stream_event","event":{"type":"input_json_delta", …}}` | Token-level | Same → emits partial tool input deltas |
-| `{"type":"stream_event","event":{"type":"content_block_stop", …}}` | Token-level | Same |
-| `{"type":"stream_event","event":{"type":"message_delta","delta":{…}, "usage":{…}}}` | Per turn | Same |
-| `{"type":"stream_event","event":{"type":"message_stop"}}` | Per turn | Same |
-| `{"type":"assistant","message":{…}}` | Full-message snapshot | Skip when `--include-partial-messages` is on (duplicate of stream deltas); use as the authoritative message when it is off |
-| `{"type":"user","message":{"role":"user","content":[{"type":"tool_result", …}]}}` | Echo of caller-injected tool result (when `--replay-user-messages` is enabled) | Ignore |
-| `{"type":"result","subtype":"success","is_error":false, …, "total_cost_usd":…, "usage":{…}, "modelUsage":{…}, "session_id":"…", "terminal_reason":"completed"}` | Terminal | Build usage map; emit `:done`; complete `Response`/`StreamResponse` |
+| `{"type":"system","subtype":"init", …, "session_id":"…", "model":"…", "tools":[…], "mcp_servers":[{"name":"…","status":"connected\|failed\|needs-auth"}], "apiKeySource":"none\|env\|…"}` | Per session | Capture `session_id` into stream metadata. **Inspect `mcp_servers[].status`** — any `"failed"` entry for a server we registered (U4) means user-defined tools won't be reachable; surface as `ReqLLM.Error.API.Request` (status 502) before the model emits anything. `apiKeySource: "none"` confirms subscription auth; other values trigger a warning in metadata but don't fail the request |
+| `{"type":"system","subtype":"status", "status":"requesting\|…"}` | Status pings | Ignore (informational); never emit a `StreamChunk` from these |
+| `{"type":"rate_limit_event", "rate_limit_info":{"status":"allowed\|throttled","resetsAt":…,"rateLimitType":"five_hour","overageStatus":…}}` | Per turn | Surface into stream metadata under `:rate_limit` (last value wins). If `status != "allowed"`, emit a `StreamChunk.meta(%{rate_limit_warning: …})` so consumers see it before any tokens flow |
+| `{"type":"stream_event","event":{"type":"message_start", …, "ttft_ms":…}}` | Token-level (only with `--include-partial-messages`) | Forward `event` payload to `Anthropic.Response.decode_stream_event/3`. The CLI adds `ttft_ms` which the Anthropic decoder ignores; that's safe |
+| `{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text\|thinking\|tool_use","…":…}}}` | Token-level | Same — the decoder handles `text`, `thinking`, and `tool_use` block types correctly (verified: `lib/req_llm/providers/anthropic/response.ex`). **`thinking` blocks must be preserved through to U7** so the tool input extractor knows the model thought before calling the tool |
+| `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta\|thinking_delta\|input_json_delta","…":…}}}` | Token-level | Same → emits `StreamChunk.text(...)`, `StreamChunk.thinking(...)`, or partial tool input deltas as appropriate |
+| `{"type":"stream_event","event":{"type":"content_block_stop","index":…}}` | Token-level | Same — also the trigger for U4 to flush an accumulated `tool_use` block to the dispatcher |
+| `{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":…}, "usage":{…}}}` | Per turn | Same — `stop_reason: "tool_use"` is the signal that the CLI is waiting for a `tool_result` event on stdin |
+| `{"type":"stream_event","event":{"type":"message_stop"}}` | Per turn | Same; in a tool round-trip turn, **does not** mean the call is over (the CLI will emit a new `message_start` after we write the `tool_result`) |
+| `{"type":"assistant","message":{…}}` | Full-message snapshot | Skip when `--include-partial-messages` is on (duplicate of stream deltas); use as the authoritative message when it is off (only path the non-streaming `generate_text` adapter sees) |
+| `{"type":"user","message":{"role":"user","content":[{"type":"tool_result", …}]}}` | Echo of caller-injected tool result (only when `--replay-user-messages` is enabled — we don't set it in v1) | Ignore — included here for completeness in case the flag gets turned on for debugging |
+| `{"type":"result","subtype":"success","is_error":false, …, "total_cost_usd":…, "usage":{…}, "modelUsage":{…}, "session_id":"…", "terminal_reason":"completed\|incomplete\|max_tokens\|cancelled", "permission_denials":[…]}` | Terminal | Build usage map; emit `:done`; complete `Response`/`StreamResponse`. **`permission_denials` non-empty** means the model tried to use a built-in tool that `--allowedTools`/`--disallowedTools` blocked — surface under `response.metadata[:permission_denials]` so the caller knows |
 | `{"type":"result","subtype":"error","is_error":true, "error":…}` | Terminal-error | Wrap into `ReqLLM.Error.API.Response` with status synthesized from `terminal_reason` |
 
 Tool round-trip (caller-side):
@@ -247,9 +247,33 @@ For streaming, `attach_stream/4` is the wrong seam because it must return a `Fin
 
 ### D3. Advertise user-defined tools through an in-process MCP stdio sidecar, not through stream-json events
 
-**Rationale.** The CLI has no stream-json-level tool-registration message. The only ways to expose Elixir-side tools to Claude Code are (a) `--mcp-config` pointing at a JSON config with an MCP stdio server, (b) `--mcp-config` pointing at an HTTP MCP server, (c) `--tools`/`--allowedTools` for built-ins only. Option (a) is the lightest: the provider starts a small MCP stdio server (likely `Hermes` or a hand-rolled minimal MCP responder), writes a one-line MCP config to a temp file, passes that file via `--mcp-config`, and tears it down after the call. The MCP server's `tools/list` returns the user-defined `ReqLLM.Tool` schemas; its `tools/call` dispatches to the Elixir callback.
+**Rationale.** The CLI has no stream-json-level tool-registration message. The only ways to expose Elixir-side tools to Claude Code are (a) `--mcp-config` pointing at a JSON config with an MCP stdio server, (b) `--mcp-config` pointing at an HTTP MCP server, (c) `--tools`/`--allowedTools` for built-ins only. Option (a) is the lightest: the provider starts a small MCP stdio server (a hand-rolled minimal MCP responder is enough — the protocol's `initialize` / `tools/list` / `tools/call` subset is small), writes a one-line MCP config to a temp file, passes that file via `--mcp-config --strict-mcp-config`, and tears it down after the call.
 
-**Tradeoff.** This is more machinery than a raw stream-json round-trip would be, but it's the protocol the CLI actually speaks. The user's prompt described the tool flow as a stream-json round-trip; the implementation must adjust because the CLI doesn't expose that surface. Phase 2 question Q1 records this as a planning decision the implementer should validate before building U4 — if a stream-json-level mechanism *has* shipped in a later CLI version, the implementer should prefer it.
+**Verified during deepening (CLI 2.1.119).** The probe `claude -p --input-format stream-json --output-format stream-json --mcp-config /tmp/test_mcp.json --strict-mcp-config …` accepts a JSON file of shape:
+
+```json
+{
+  "mcpServers": {
+    "req-llm-tools": {
+      "type": "stdio",
+      "command": "<beam-side wrapper executable>",
+      "args": ["<sidecar-mode args…>"],
+      "env": {"REQ_LLM_TOOL_SOCKET": "/tmp/req_llm_<uuid>.sock"}
+    }
+  }
+}
+```
+
+The CLI's `system/init` event reports each server's connection status under `mcp_servers[].status` (`connected`, `failed`, `needs-auth`). U4 reads that field at the very first init event and fails fast with `ReqLLM.Error.API.Request` (synthetic status 502) if any server we registered came up `failed` — this prevents the call from silently proceeding without the user's tools advertised.
+
+**Implementation shape (directional).** The sidecar can't be a long-running BEAM process because the CLI spawns the configured `command` as a separate OS process. Two viable subshapes:
+
+1. **Wrapper escript that proxies to the BEAM.** A tiny escript is shipped under `priv/bin/`, configured as the MCP `command`. The escript reads MCP JSON-RPC from stdin and forwards each request over a Unix-domain socket (path passed via `env`) to the live BEAM process that owns the call. Tool dispatch happens BEAM-side; the response travels back over the socket and out the escript's stdout.
+2. **Hand-rolled Elixir escript that compiles in the user's tool registry at start.** Simpler but breaks tool callbacks that close over the BEAM's runtime state.
+
+**Decision: subshape 1** — keeps Elixir callbacks live and natural, at the cost of one Unix socket per call. Sockets are scoped to a `/tmp/req_llm_<uuid>.sock` path and unlinked in the `after` block alongside the temp `--mcp-config` file.
+
+**Tradeoff.** This is more machinery than a raw stream-json round-trip would be, but it's the protocol the CLI actually speaks. The user's prompt described the tool flow as a stream-json round-trip; the implementation adjusts because the CLI doesn't expose that surface. The compensating wins are (a) MCP is a public, versioned protocol with downstream stability guarantees, (b) the same sidecar can later be repurposed if the user ever wants to expose ReqLLM tools to arbitrary MCP clients, (c) failure detection via `mcp_servers[].status` is precise and observable.
 
 ### D4. Pin a minimum supported `claude` CLI version and detect drift via `claude --version`
 
@@ -351,13 +375,24 @@ Tests inject the fake binary path via the new `:claude_binary` provider option, 
 - `test/support/claude_agent_fixtures/version_mismatch.jsonl`
 
 **Approach.**
-- `Port.open({:spawn_executable, binary}, [:binary, :stderr_to_stdout, …])` is the wrong choice — we need stderr separately for error context. Use `:exec` is also wrong (extra dep). The right choice is `Port.open({:spawn_executable, binary}, [:binary, :exit_status, :hide, args: […]])` for stdout and a second `Port.open` with `:stderr_to_stdout: false` is not supported on `:spawn_executable`. Use `erlexec` or a small `cmd` wrapper? **Decision: use a wrapper script under `priv/bin/claude_agent_runner.sh`** that exec's the configured binary with `2> >(cat >&2)` redirection… actually no. The cleanest BEAM-native path is **two ports**: one with `[:binary, :exit_status, :stderr_to_stdout]` (mingles streams; only used if we ever need it) versus the standard pattern of `System.cmd/3` for one-shot calls and `Port.open` for streaming. For one-shot non-streaming this unit, we can do `System.cmd("claude", args, stderr_to_stdout: false, input: stdin_bytes)` — `System.cmd/3` returns `{stdout, exit_code}` and accepts stdin via the `:input` option. But `:input` only works with the `:binary` option and is buffered (no interactive tool round-trip). **Final decision for U2:** use `Port.open/2` with `[:binary, :exit_status, :hide, args: cli_args]` and `Process.send/3` to write to stdin via `Port.command/2`. Capture stderr by setting `args: ["-c", "exec claude … 2>>" <> stderr_tmpfile]` is fragile. **Cleanest answer: use the existing `erlexec` pattern? Not a dep.** Use raw `Port.open/2` with `:stderr_to_stdout` *enabled* and demultiplex by line: any stdout line that isn't valid stream-json is treated as stderr/diagnostic and accumulated for error context. This trades a small ambiguity (interleaving) for not adding a wrapper script.
-- The above is recorded as **planning question Q2** — implementer to confirm the stderr handling approach during U2; the test scenarios are written to work with either decision because the *observable* behavior is what they check.
-- Version detection: cache `claude --version` output in `:persistent_term` keyed by binary path. Pin minimum to `2.1.119` (the version validated for this plan).
+- **Port + per-line stream-json demux (resolved during deepening).** Use `Port.open({:spawn_executable, binary}, [:binary, :exit_status, :hide, :stderr_to_stdout, args: cli_args])`. Both streams arrive on the same port; we line-split incoming bytes, then classify each line:
+  - Line parses as JSON with a known `type` field (`system`, `assistant`, `user`, `stream_event`, `rate_limit_event`, `result`) → forward to the stream-json handler.
+  - Line fails to parse OR parses to JSON without a recognized `type` → append to a per-call `diagnostic_buffer` (size-capped at 64KB; older bytes are dropped with a flag so the error message can say "stderr truncated").
+  - Empty line → skip.
+  This trades a small ambiguity (CLI could in principle emit a stderr line that happens to be valid stream-json — observed never to happen across the protocol probes for this plan) for not shipping a wrapper script, not adding `erlexec` as a dep, and not depending on platform-specific FIFO behavior. The classifier is the single source of truth for "is this a protocol event or diagnostic noise."
+- **Rejected alternatives** (recorded for posterity, since they were live options during the first pass):
+  - `System.cmd/3` with `:input` — buffered stdin, no interactive tool round-trip; usable for one-shot calls without tools but breaks U4 entirely. Not worth two code paths.
+  - Wrapper shell script under `priv/bin/` doing `2>>tmpfile` — adds an OS dependency (shell semantics differ on Windows), adds a temp-file lifecycle, gives nothing back over per-line demux.
+  - `:exec` / `erlexec` package — would split streams cleanly, but adding a runtime dep for a single subprocess flow is the wrong tradeoff. Out of scope.
+- **stdin writes:** `Port.command(port, line <> "\n")` for each outgoing stream-json event (initial user event, subsequent tool_result events). The CLI consumes one JSON object per line and is line-buffered.
+- **Lifecycle:** Spawn → write initial user event → read loop dispatched on `{port, {:data, chunk}}` and `{port, {:exit_status, n}}` messages → on `result` event or terminal exit, run `Port.close(port)` (idempotent — closing an already-closed port is a no-op) and reap any lingering message in the mailbox. `Process.flag(:trap_exit, true)` is **not** set on the calling process for the non-streaming path; instead the `Port.close` + selective receive pattern is enough because `:spawn_executable` ports send `{:exit_status, _}` automatically.
+- **Cancellation:** Caller-side timeout (`:cli_timeout`) fires a `Process.send_after(self(), :cli_timeout, ms)`. On firing, run `Port.close(port)`, drain pending port messages, return `{:error, %ReqLLM.Error.API.Request{reason: :timeout, …}}`. Caller process cancellation (caller killed mid-call) — since the port is owned by the calling process and `:spawn_executable` ports get a SIGTERM when the BEAM port owner dies, the OS process is reaped automatically; the U2 cleanup test scenario verifies this is actually happening.
+- **Version detection:** Cache `claude --version` output in `:persistent_term` keyed by binary path. Pin minimum to `2.1.119` (the version validated for this plan). The version check is invoked lazily on the first request through the provider; subsequent requests hit the cache. Cache invalidation: BEAM restart, or explicit `ReqLLM.Providers.ClaudeAgent.CLI.invalidate_version_cache!/0` for power users on a CI host doing rolling upgrades.
 - Build CLI args: `["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--model", model_id]` plus optional `--resume`, `--allowedTools`, `--disallowedTools`, `--permission-mode`. **`--verbose` is required because `--print` + `--output-format=stream-json` errors out without it** — discovered during protocol validation.
 - Write initial user event: `%{"type" => "user", "message" => %{"role" => "user", "content" => extract_text_or_blocks(context)}}` as a single line + `\n`.
 - Read loop: `receive do {port, {:data, chunk}} -> ...` accumulates bytes, splits on `\n`, JSON-decodes each line, dispatches by `event.type`. On `{:exit_status, n}`, finalize: if a `result` event was seen, return synthesized `%Req.Response{}`; otherwise raise `ReqLLM.Error.API.Response` carrying captured stderr.
 - Synthesized response shape: see "Synthetic Req.Response shape" in the technical design. The Response builder reuses `Anthropic.Response.decode_stream_event/3` against the accumulated `stream_event` payloads, then renders the final accumulated message via the existing Anthropic non-streaming response shape.
+- **Init-event `apiKeySource` observability.** Capture the value (`"none" | "env" | "settings" | …`) into stream metadata under `:cli_api_key_source`. Subscription users see `"none"`; if a caller expected subscription-only and the value is something else, they have a clear diagnostic. v1 does *not* fail on a mismatch — `claude` is the auth boundary and the user has already opted into whatever they configured — but the observable surface lets callers add their own assertions.
 - Cancellation: caller-side timeout (`:cli_timeout`) sends an exit signal to the port; the adapter returns `{:error, %ReqLLM.Error.API.Request{reason: :timeout, …}}`. Catch-all `after` block sends `Port.close/1` to guarantee cleanup.
 
 **Patterns to follow.**
@@ -403,7 +438,9 @@ end
 - Error path — missing binary: `ReqLLM.generate_text` with `:claude_binary => "/no/such/path"` returns `{:error, %ReqLLM.Error.Invalid.Capability{}}` whose message mentions the path and the install hint.
 - Error path — version drift: fake binary configured to print `1.5.0` for `--version` → returns `Invalid.Capability` with the required-version message.
 - Error path — auth failure: fake binary writes the `auth_failure.jsonl` script then exits 1 → returns `%ReqLLM.Error.API.Request{status: 401, response_body: <stderr>}`.
-- Error path — non-JSON line on stdout: fake binary emits `"this is not JSON\n"` → returns `%ReqLLM.Error.API.Response{reason: "stream-json protocol error", …}` with the offending line in `response_body`.
+- Error path — non-JSON line on stdout: fake binary emits `"this is not JSON\n"` interleaved with valid events → the non-JSON line lands in the diagnostic buffer, the valid events continue to flow, and if the call still ends successfully via a `result` event the diagnostic is exposed under `response.metadata[:diagnostic_buffer]`. If the call ends *without* a `result` event, the error returned to the caller carries the diagnostic buffer in `response_body` (this is the "auth failure" / "permission denied" surfacing path).
+- Edge case — line that parses as JSON but has unknown `type`: same handling as "non-JSON line" — appended to diagnostic buffer; the protocol-error path triggers only on missing terminal `result` event.
+- Edge case — diagnostic buffer overflow: fake binary emits >64KB of garbage → buffer is truncated at the cap; `response.metadata[:diagnostic_buffer_truncated]` is `true`.
 - Error path — port crash mid-stream (fake binary `kill -9`s itself): returns `%ReqLLM.Error.API.Request{reason: ~r/port closed unexpectedly/}` with whatever stderr was captured.
 - Error path — timeout: fake binary sleeps 5s, `:cli_timeout => 100` → returns `%ReqLLM.Error.API.Request{reason: :timeout}` within 200ms wall time; verify the port process is gone (`Process.alive?` on the port).
 - Error path — caller cancellation: caller process killed mid-call → port process is reaped within 1s.
@@ -498,29 +535,41 @@ end
 - `test/support/claude_agent_fixtures/tool_error.jsonl` (callback raises / returns error)
 
 **Approach.**
-- The MCP sidecar is the implementation detail behind tool advertisement. v1 implementation: a small `GenServer` that listens on stdio (via `IO.binread/2` / `IO.binwrite/2`), speaks the MCP `tools/list` + `tools/call` methods, and dispatches `tools/call` to the matching `ReqLLM.Tool` callback. The sidecar process is started before the CLI Port and torn down after.
-- `tools/call` errors:
-  - Callback returns `{:error, reason}` → MCP response carries the error message; the CLI surfaces this back to the model as `is_error: true`; the user-facing ReqLLM result still completes successfully with the model's recovery turn.
-  - Callback raises → catch the exception; same error shape as above; the raised exception is recorded in stream metadata under `:tool_errors` for the caller's diagnostics.
-- The U2/U3 adapters need a small extension: when the accumulated content blocks include any `tool_use` blocks, the adapter does **not** terminate on `message_stop`; it stays in the read loop, dispatching tool calls (via the sidecar's already-running tools/call handler) and waiting for the next `message_start` from the CLI's continuation.
-- Built-in tools (Read, Bash, etc.) are orthogonal: those flow through `--allowedTools` and don't touch the MCP path.
+- **MCP sidecar = wrapper escript + BEAM-side dispatcher (per D3).** Per call:
+  1. Generate a UUID; mint a socket path `/tmp/req_llm_<uuid>.sock` (Windows: `\\.\pipe\req_llm_<uuid>`).
+  2. Start a `GenServer` (the BEAM-side dispatcher) that listens on the socket, holds the `ReqLLM.Tool` registry for this call, and runs `tools/call` against the matching callback when MCP requests arrive.
+  3. Write a temp `--mcp-config` JSON file with one stdio server entry whose `command` is the shipped escript path (`priv/bin/req_llm_mcp_proxy`) and whose `env` carries the socket path.
+  4. Spawn the CLI with `--mcp-config <tmpfile> --strict-mcp-config`. `--strict-mcp-config` ensures the user's home-directory MCP config does not bleed into the call.
+  5. The escript subprocess is spawned by the CLI; it connects to the socket, the CLI then sends MCP `initialize` and `tools/list` to the escript over stdio, the escript proxies to the BEAM dispatcher, the dispatcher returns the user-defined tool list as JSON Schema (built from `ReqLLM.Tool` specs via `ReqLLM.Schema.to_json/1`).
+- **Init validation.** As soon as the first `system/init` event arrives on the CLI's stdout, inspect `mcp_servers[].status` for our registered server (named `req-llm-tools`). On `"failed"`, immediately fail the request with `ReqLLM.Error.API.Request{reason: "MCP sidecar failed to advertise tools", status: 502, response_body: diagnostic_buffer}`. On `"needs-auth"`, same — sidecars we control should never need auth and that's a configuration bug. On `"connected"`, proceed. This check runs *before* the model is given a chance to act, so a misadvertised tool surface fails loud.
+- **Tool dispatch (`tools/call`):**
+  - Callback returns `{:ok, result}` → MCP response with the result encoded as a text content block (or JSON-stringified if non-binary); the CLI gives this to the model as the tool result.
+  - Callback returns `{:error, reason}` → MCP response with `isError: true` and the reason in the content; the CLI passes this back as a `tool_result` with `is_error: true`; the user-facing ReqLLM call still completes successfully with the model's recovery turn.
+  - Callback raises → caught, same shape as `{:error, reason}` with the Exception's `message/1`; the raised class+stacktrace recorded in `response.metadata[:tool_errors]`.
+- **Stream-json loop coupling.** The U2/U3 adapters need a small extension: the loop's terminal predicate is the `result` event, not `message_stop`. When the model emits a `tool_use` content block, the CLI handles the round-trip *through the sidecar* — the BEAM-side adapter does NOT write a `tool_result` event on stdin (that path is the older HTTP-style flow and is not how MCP-advertised tools flow in this CLI). The adapter simply keeps reading until `result` arrives; tool execution happens out-of-band via the sidecar's `tools/call` handling. The `tool_result` stream-json event row in the protocol table is preserved only for completeness — we don't emit it.
+- **Built-in tools (Read, Bash, etc.) are orthogonal:** those flow through `--allowedTools`/`--disallowedTools` and don't touch the MCP path. `:allowed_tools => :none` + no user tools → no `--mcp-config` flag at all (avoids the sidecar startup cost on tool-free calls). `:allowed_tools` and user-defined tools coexist freely.
+- **Cleanup.** `after` block on every exit path: stop the dispatcher GenServer, delete the socket file, delete the temp `--mcp-config` file. Use `File.rm/1` (idempotent) so double-cleanup on retry doesn't error.
 
 **Patterns to follow.**
 - `lib/req_llm/tool.ex` for the `ReqLLM.Tool` callback contract.
 - `lib/req_llm/providers/anthropic/context.ex:380-410` for the existing Anthropic tool-encoding shape (we'll convert our `ReqLLM.Tool` specs to the same JSON Schema shape, but expose them through MCP `tools/list` rather than via the `tools` field in the request body).
 
 **Test scenarios.**
-- Happy path (single-turn tool): user-defined `weather` tool, fake CLI replays `tool_round_trip.jsonl` → the tool callback is invoked exactly once with the right args; the model's final text turn is in the response.
+- Happy path (single-turn tool): user-defined `weather` tool, fake CLI replays `tool_round_trip.jsonl` (which mocks the *CLI*'s side of the protocol — assistant emits a `tool_use` block, then after a synthetic delay emits the recovery turn) and the test's MCP dispatcher is invoked via the real socket → assertion: the dispatcher's callback was invoked exactly once with the right args; the model's final text turn is in the response.
 - Happy path (multi-turn): tool called twice with different args; final response reflects both results.
 - Happy path (streaming): `stream_text/3` with a tool — consumer sees text chunks before and after the tool round-trip; the stream completes with one terminal `:done`.
+- **MCP advertisement failure**: fake CLI emits `mcp_servers:[{name:"req-llm-tools", status:"failed"}]` in its init event → call fails fast with `ReqLLM.Error.API.Request{status: 502, reason: ~r/MCP sidecar/}` **before** any model tokens are emitted; the BEAM-side dispatcher is reaped within 1s of the error.
+- **Sidecar process lifecycle**: counting `pgrep -f req_llm_mcp_proxy` across 50 sequential tool-using calls → process count never exceeds 1 mid-call and is 0 between calls (sidecar process gone, temp socket file gone, temp `--mcp-config` file gone).
+- **CLI args wiring**: with user tools registered, argv contains `--mcp-config <path>` AND `--strict-mcp-config`. With `:allowed_tools => :none` and no user tools, argv contains neither.
 - `:allowed_tools` interaction: when only `["Read"]` is allowed *and* a user-defined `weather` tool is registered, both appear (user-defined via MCP, built-in via `--allowedTools`); `:allowed_tools => :none` and no user tools → no `--mcp-config` flag.
-- Tool callback returns `{:error, reason}` → `tool_result` carries `is_error: true`; conversation continues; final response includes the model's recovery turn; `response.metadata[:tool_errors]` is non-empty.
+- Tool callback returns `{:error, reason}` → MCP response carries `isError: true`; the CLI re-prompts the model with the tool failure; final response includes the model's recovery turn; `response.metadata[:tool_errors]` is non-empty.
 - Tool callback raises an exception → same observable behavior; the exception class is in `response.metadata[:tool_errors]`; no crash propagates to the caller.
-- Tool callback that returns a non-string (e.g., a map) → encoded as JSON; CLI receives a text block containing the JSON.
-- Edge case — tool name collision with a built-in (`Read`): the user-defined tool wins (MCP namespace) but a warning is logged; assert the warning surfaces.
-- Edge case — long tool result (>1MB): writes succeed; CLI processes; final response is correct.
-- Concurrent tool dispatch: two consecutive `tool_use` events in the same turn → callbacks dispatched in order; tool_result events written in matching order.
-- Cleanup: after a tool-using call completes, the MCP sidecar process is gone, the temp `--mcp-config` file is deleted.
+- Tool callback that returns a non-string (e.g., a map) → encoded as JSON via `Jason.encode!/1`; CLI receives a text block containing the JSON.
+- Edge case — tool name collision with a built-in (`Read`): the user-defined tool wins under the MCP namespace and the built-in is suppressed by the CLI per its tool-resolution rules; assert via a `tool_use` event whose `id` namespace shows `mcp__req-llm-tools__Read` (the CLI's MCP-namespaced tool naming convention).
+- Edge case — long tool result (>1MB): writes succeed via the Unix socket; CLI processes; final response is correct.
+- Concurrent tool dispatch (two `tool_use` blocks in one turn): callbacks dispatched in arrival order; sidecar serializes responses on the socket.
+- Permission denials: `:allowed_tools => :none` + model attempts `Bash` → `response.metadata[:permission_denials]` is non-empty; no crash.
+- Cleanup: after a tool-using call completes (success or failure), the MCP sidecar OS process is gone, the temp socket file is unlinked, the temp `--mcp-config` file is deleted. Verify via shell out: no stragglers in `/tmp/req_llm_*.sock`, no `req_llm_mcp_proxy` processes.
 
 **Verification.**
 - `mix test test/provider/claude_agent/tools_test.exs` passes.
@@ -630,14 +679,19 @@ end
 - Reuse the `prepare_strict_tool_request/4` pattern from the HTTP provider: build a `ReqLLM.Tool` named `structured_output` whose `parameter_schema` is the caller's compiled schema; set `tool_choice` to force its use; route through the normal `:chat` path; let U4's tool dispatch capture the tool input as the structured object.
 - The `Generation.execute_generate_object/7` flow (`lib/req_llm/generation.ex:337-370`) handles post-processing identically across providers, including type coercion via `coerce_object_types/2` — we just need to surface the tool's input args as `response.object`.
 - The Anthropic provider's logic for choosing between `:json_schema` and `:tool_strict` modes (`lib/req_llm/providers/anthropic.ex:222-285`) is *not* needed here — there's no native JSON-schema path in v1. The `:object` operation always routes through the tool-strict path.
+- **Tool name namespace caveat (verified during deepening).** Because user-defined tools are advertised via the MCP sidecar, the CLI exposes them as `mcp__req-llm-tools__<name>` to the model — not as bare `<name>`. The U4 `tool_use` content blocks carry the prefixed name. U7's object extractor matches by *suffix* (the last path segment after `__`), not the full name, so it survives this prefix without leaking the namespace to callers. Verify in test that `response.object` is unprefixed.
+- **Thinking blocks before tool calls (verified during deepening).** Models can emit a `thinking` content block before the `structured_output` tool call. The extractor must scan the assistant message's content blocks for the *first* `tool_use` whose name has the `structured_output` suffix, not assume the tool call is the first or only block. If the assistant emits text + thinking but no `tool_use`, that's the existing "no structured output produced" error path.
+- The `tool_choice` mechanism (force `structured_output`) does not currently work for the CLI path the same way it does over HTTP — CLI tools are advertised via MCP, and the CLI does not honor a `tool_choice` directive applied to MCP-namespaced tools. The implementer should validate this during U7 and, if `tool_choice` is ignored, fall back to a system-prompt prefix instructing the model to call `structured_output` immediately. Flag as Q4 below if it requires a workaround.
 
 **Test scenarios.**
 - Happy path: schema `[name: :string, age: :integer]`, fake CLI returns a tool_use with `%{"name" => "Alice", "age" => 30}` → `ReqLLM.generate_object("claude_agent:…", "Give me a person", schema)` returns `{:ok, %Response{object: %{name: "Alice", age: 30}}}`.
+- **MCP namespace handling**: fake CLI emits a `tool_use` block whose `name` is `mcp__req-llm-tools__structured_output` (CLI's MCP-prefixed shape, verified during deepening) → extractor strips the prefix and surfaces the unprefixed object; `response.object` does not contain the prefix.
+- **Thinking blocks before tool call**: fake CLI emits content sequence `[thinking, text, tool_use(structured_output, {...})]` → extractor finds the tool call regardless of position; `response.object` is populated correctly; `response.metadata[:thinking]` carries the thinking content (consistent with how Anthropic HTTP provider surfaces it).
 - Type coercion: CLI returns `%{"age" => "30"}` (string) → existing `coerce_object_types` converts to integer.
 - Required-field missing: CLI returns `%{"name" => "Alice"}` (no age) → validation error surfaces with the missing-field message.
 - Schema with nested objects: CLI returns nested JSON → preserved through the pipeline.
 - Schema with arrays: CLI returns array values → preserved.
-- Error path — CLI emits text without a tool_use: returns `%ReqLLM.Error.API.Response{reason: ~r/no structured output produced/}`.
+- Error path — CLI emits text + thinking but never a `tool_use`: returns `%ReqLLM.Error.API.Response{reason: ~r/no structured output produced/}`. (`tool_choice` may or may not be honored on the MCP path — Q4.)
 - Edge case — assistant message ends with no tool_use and no text: error path same as above.
 - Streaming `generate_object/4` is not part of this unit — it's not currently in the v1 scope (only `generate_text`, `stream_text`, tools, `generate_object`).
 
@@ -753,7 +807,8 @@ end
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | **CLI stream-json schema changes between releases** | High over months, low over weeks | Provider breaks for users on a newer CLI | D4: pin minimum version with `claude --version` check; document the pin and the bump procedure; fixtures are versioned alongside the binary version |
-| **MCP sidecar approach is wrong for tool advertisement** | Medium | U4 architecture rework | Phase 2 question Q1 explicitly defers this until U4 starts — the implementer must validate the mechanism against the current CLI before committing. Fallback: if a stream-json tool-declaration mechanism has shipped, use it instead and skip the sidecar |
+| **MCP sidecar approach is wrong for tool advertisement** | Low (verified against CLI 2.1.119 during deepening) | U4 architecture rework | Validated via direct probe — see D3. The `mcp_servers[].status` field in the init event gives the implementer a clean fail-fast point if registration ever stops working. Watch: future CLI versions may add a stream-json tool-definitions message, at which point retire the sidecar |
+| **CLI does not honor `tool_choice` on MCP-advertised tools** | Medium | `generate_object/4` may not consistently force the structured_output tool, producing intermittent "no structured output" errors | Q4 records the workaround (system-prompt prefix via `--append-system-prompt`) — small to ship if needed. U7 includes a live-test scenario specifically to confirm; tests catch this in the first run |
 | **Zombie `claude` processes leak under cancellation / crash** | Medium | OS resource exhaustion in long-running BEAM nodes | Explicit `Port.close/1` in adapter `after` blocks (U2); link the streaming task to the StreamServer (U3); test scenario "100 sequential calls leave zero zombies"; integration smoke test that runs `pgrep claude` between test files |
 | **Per-call CLI spawn cost (1-3s) makes the provider slow for chat-loop apps** | High for chat-loop use cases | Latency complaints | Documented in the guide. v1 ships per-call spawn; session pool is a follow-up. Callers can use `:session_id` to keep model state warm even if the BEAM has to re-spawn |
 | **Fake binary protocol drifts from real CLI protocol** | Medium | Tests pass while real-world flow is broken | U8 live suite runs the same scenarios against the real binary; CI scheduled run on a host with a `claude` login; fixture format includes the CLI version so drift is detectable |
@@ -766,11 +821,18 @@ end
 
 ## Open Planning Questions
 
-Resolve these before or during the named units; none block the rest of the plan.
+Resolved questions are kept here for traceability; live questions sit at the bottom. None block the rest of the plan.
 
-- **Q1 (U4):** Does the current `claude` CLI expose a stream-json-level tool-advertisement mechanism (newer than the 2.1.119 surface inspected for this plan)? If yes, prefer it over the MCP stdio sidecar — fewer moving parts and tighter integration. Validate via `claude --help`, `claude --print --help`, and the public Claude Code changelog when U4 starts. If unchanged, proceed with the MCP sidecar as designed.
-- **Q2 (U2):** Final stderr-handling shape — separate FIFO via wrapper script, or `:stderr_to_stdout` with per-line demux? The plan flags this as a planning question because both approaches have known tradeoffs; the implementer picks the simpler one once they see what BEAM Port APIs cleanly support on the target OS. Test scenarios are written against observable behavior, so they cover either choice.
+**Resolved during deepening (CLI 2.1.119 probes).**
+
+- **Q1 (U4) — RESOLVED.** The CLI does *not* expose a stream-json-level tool-advertisement mechanism in 2.1.119. The MCP stdio sidecar path is the only viable one. Verified config shape and init-event `mcp_servers[].status` reporting; both are now part of D3 and U4 with concrete shape and failure-detection logic. Drift watch: if a future CLI version adds a stream-json `tool_definitions` directive, the implementer should prefer it and retire the sidecar.
+- **Q2 (U2) — RESOLVED.** Use `Port.open/2` with `[:binary, :exit_status, :hide, :stderr_to_stdout, args: …]` and demultiplex per line: any line that doesn't parse as a known stream-json `type` is treated as diagnostic. Rejected alternatives (wrapper script, `:exec` dep, `System.cmd/3` with `:input`) recorded in U2's Approach for traceability.
+
+**Live (to be answered during the named unit).**
+
 - **Q3 (U6):** Should `response.metadata[:cli_reported_cost_usd]` be the headline cost field (CLI's honest opinion) or the "computed from token counts × Anthropic API rates" figure (comparable to the HTTP provider)? Plan defaults to the latter for cross-provider parity, with the CLI's figure exposed under metadata. Confirm during U6 with a quick check of how downstream observability dashboards in the project (if any) consume `response.usage.cost`.
+- **Q4 (U7):** Does the CLI honor `tool_choice = {type: "tool", name: "structured_output"}` when the tool is advertised through MCP (`mcp__req-llm-tools__structured_output`)? Anthropic's HTTP API honors `tool_choice` for native tools, but the CLI's MCP path may treat MCP tools as ordinary suggestions. If `tool_choice` is silently ignored, the workaround is to prepend a short system-prompt instruction ("Respond by immediately calling the `structured_output` tool.") via `--append-system-prompt`. Validate during U7 with a single live test; the workaround is small enough to ship if needed without restructuring U7.
+- **Q5 (U3 / future):** The `system/init` event carries an extensive `tools`, `agents`, `skills`, and `plugins` list that reflects the host's full Claude Code environment, including third-party plugins the user has installed. This is leakage of host-side configuration into ReqLLM's session. Plan ships v1 ignoring these fields; a follow-up could surface them as a `response.metadata[:cli_environment]` summary for observability. Not blocking.
 
 ---
 
