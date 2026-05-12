@@ -106,6 +106,9 @@ defmodule ReqLLM.Provider.ResponseBuilder do
   def for_model(%LLMDB.Model{provider: :anthropic}),
     do: ReqLLM.Providers.Anthropic.ResponseBuilder
 
+  def for_model(%LLMDB.Model{provider: :claude_agent}),
+    do: ReqLLM.Providers.Anthropic.ResponseBuilder
+
   def for_model(%LLMDB.Model{provider: :google}), do: ReqLLM.Providers.Google.ResponseBuilder
 
   def for_model(%LLMDB.Model{provider: :minimax}), do: ReqLLM.Providers.Minimax.ResponseBuilder

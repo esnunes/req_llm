@@ -217,6 +217,24 @@ defmodule ReqLLM.Streaming do
     end
   end
 
+  defp start_transport_streaming(:port, provider_mod, model, context, opts, stream_server_pid) do
+    case StreamServer.start_http(
+           stream_server_pid,
+           provider_mod,
+           model,
+           context,
+           Keyword.put(opts, :stream_transport, :port),
+           ReqLLM.Finch
+         ) do
+      {:ok, task_pid, http_context, canonical_json} ->
+        {:ok, task_pid, http_context, canonical_json}
+
+      {:error, reason} ->
+        Logger.error("Failed to start Port streaming: #{inspect(reason)}")
+        {:error, {:port_streaming_failed, reason}}
+    end
+  end
+
   defp start_transport_streaming(:http, provider_mod, model, context, opts, stream_server_pid) do
     start_http_streaming(provider_mod, model, context, opts, stream_server_pid)
   end

@@ -25,6 +25,7 @@ LLM APIs are inconsistent. ReqLLM provides a unified, idiomatic Elixir interface
 | [Alibaba Cloud Bailian](https://www.alibabacloud.com/help/en/model-studio) | `alibaba` | — |
 | [Alibaba Cloud Bailian (China)](https://www.alibabacloud.com/help/en/model-studio) | `alibaba_cn` | — |
 | [Anthropic](https://anthropic.com) | `anthropic` | [Guide](guides/anthropic.md) |
+| [Claude Code CLI](https://claude.com/code) | `claude_agent` | [Guide](guides/claude-agent-provider.md) |
 | [OpenAI](https://openai.com) | `openai` | [Guide](guides/openai.md) |
 | [Google Gemini](https://ai.google.dev) | `google` | [Guide](guides/google.md) |
 | [Google Vertex AI](https://cloud.google.com/vertex-ai) | `google_vertex` | [Guide](guides/google_vertex.md) |

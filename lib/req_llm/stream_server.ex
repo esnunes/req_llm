@@ -425,7 +425,8 @@ defmodule ReqLLM.StreamServer do
     streamer_mod =
       case Keyword.get(opts, :stream_transport) do
         :websocket -> ReqLLM.Streaming.WebSocketClient
-        _ -> ReqLLM.Streaming.FinchClient
+        :port -> ReqLLM.Providers.ClaudeAgent.StreamClient
+        _ -> default_transport_for(provider_mod)
       end
 
     case streamer_mod.start_stream(provider_mod, model, context, opts, self(), finch_name) do
@@ -1067,6 +1068,11 @@ defmodule ReqLLM.StreamServer do
 
     {List.first(matched), %{state | waiting_callers: remaining}}
   end
+
+  defp default_transport_for(ReqLLM.Providers.ClaudeAgent),
+    do: ReqLLM.Providers.ClaudeAgent.StreamClient
+
+  defp default_transport_for(_), do: ReqLLM.Streaming.FinchClient
 
   defp cancel_waiting_caller_timer(%{timer: timer}) do
     Process.cancel_timer(timer, async: true, info: false)

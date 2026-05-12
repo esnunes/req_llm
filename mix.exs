@@ -53,6 +53,7 @@ defmodule ReqLLM.MixProject do
           "guides/fixture-testing.md",
           "guides/adding_a_provider.md",
           "guides/anthropic.md",
+          "guides/claude-agent-provider.md",
           "guides/openai.md",
           "guides/google.md",
           "guides/azure.md",

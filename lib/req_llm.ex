@@ -626,6 +626,17 @@ defmodule ReqLLM do
     end
   end
 
+  defp resolve_provider_model_fallback(:claude_agent, model_id, _original_error) do
+    case LLMDB.model(:anthropic, model_id) do
+      {:ok, %LLMDB.Model{} = model} ->
+        provider_model_id = model.provider_model_id || model.id || model.model
+        {:ok, %{model | provider: :claude_agent, provider_model_id: provider_model_id}}
+
+      {:error, _reason} ->
+        model(%{provider: :claude_agent, id: model_id})
+    end
+  end
+
   defp resolve_provider_model_fallback(:mistral, model_id, _original_error) do
     model(mistral_inline_model_attrs(model_id))
   end
