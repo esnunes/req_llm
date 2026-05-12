@@ -126,17 +126,29 @@ as MCP `isError: true` to the model and accumulate under
 `response.private[:tool_errors]` so the caller can inspect what went
 wrong without crashing the request.
 
-## Streaming metadata
+## Provider metadata
 
-The non-streaming response surfaces session/CLI metadata under
-`response.provider_meta` (`:cli_session_id`, `:cli_reported_cost_usd`,
-`:cli_terminal_reason`, `:cli_api_key_source`, `:cli_permission_denials`,
-`:cli_mcp_servers`).
+Both the streaming and non-streaming paths populate
+`response.provider_meta` with CLI session and turn metadata:
 
-The streaming path does **not** yet surface that metadata — the CLI's
-`system/init` and terminal `result` events are consumed but not forwarded
-into the StreamServer's metadata channel. Track this as a follow-up if
-you need session continuity across streaming turns.
+| Key | Source | Notes |
+|---|---|---|
+| `:cli_session_id` | `system/init` + `result` | Pass back as `:session_id` to resume. |
+| `:cli_api_key_source` | `system/init` | `"none"` for subscription auth. |
+| `:cli_mcp_servers` | `system/init` | Status of each MCP server we registered (e.g. `req-llm-tools`). |
+| `:cli_rate_limit` | `rate_limit_event` | Last value wins. |
+| `:cli_reported_cost_usd` | `result.total_cost_usd` | CLI's own cost estimate. Not your bill on a subscription. |
+| `:cli_terminal_reason` | `result.terminal_reason` | `"completed"`, `"max_tokens"`, `"cancelled"`, `"incomplete"`. |
+| `:cli_permission_denials` | `result.permission_denials` | Non-empty when the model tried a tool that `--allowedTools`/`--disallowedTools` blocked. |
+| `:cli_model_usage_breakdown` | `result.modelUsage` | Per-sub-model token counts (e.g. routing Haiku). |
+
+For streaming, these arrive via the standard
+`ReqLLM.StreamResponse.to_response/1` /
+`ReqLLM.StreamResponse.MetadataHandle.await/1` channel — the CLI's
+`system/init` and terminal `result` events are forwarded into the
+StreamServer's metadata accumulator just like the per-turn `stream_event`
+deltas, so the assembled `Response` has the same `provider_meta` shape
+regardless of which path was used.
 
 ## Known limitations
 

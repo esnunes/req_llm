@@ -193,16 +193,105 @@ defmodule ReqLLM.Providers.ClaudeAgent do
 
   @impl ReqLLM.Provider
   def decode_stream_event(event, model) do
-    ReqLLM.Providers.Anthropic.Response.decode_stream_event(event, anthropic_model_view(model))
+    case classify_cli_event(event) do
+      :anthropic ->
+        ReqLLM.Providers.Anthropic.Response.decode_stream_event(
+          event,
+          anthropic_model_view(model)
+        )
+
+      {:cli_meta, meta} ->
+        case meta do
+          %{} when map_size(meta) == 0 -> []
+          _ -> [ReqLLM.StreamChunk.meta(%{provider_meta: meta})]
+        end
+    end
   end
 
   @impl ReqLLM.Provider
   def decode_stream_event(event, model, state) do
-    ReqLLM.Providers.Anthropic.Response.decode_stream_event(
-      event,
-      anthropic_model_view(model),
-      state
-    )
+    cli_state = Map.get(state, :__claude_agent__, %{})
+    anthropic_state = Map.delete(state, :__claude_agent__)
+
+    classification = classify_cli_event(event)
+
+    case classification do
+      :anthropic ->
+        {chunks, new_inner} =
+          ReqLLM.Providers.Anthropic.Response.decode_stream_event(
+            event,
+            anthropic_model_view(model),
+            anthropic_state
+          )
+
+        {chunks, Map.put(new_inner, :__claude_agent__, cli_state)}
+
+      {:cli_meta, meta} ->
+        new_cli = Map.merge(cli_state, meta)
+        chunk_meta = build_chunk_meta(event, new_cli)
+        chunks = [ReqLLM.StreamChunk.meta(chunk_meta)]
+        {chunks, Map.put(anthropic_state, :__claude_agent__, new_cli)}
+    end
+  end
+
+  defp build_chunk_meta(%{data: %{"type" => "result"} = ev}, cli) do
+    base = %{
+      provider_meta: cli,
+      terminal?: true,
+      finish_reason: finish_reason_from_terminal(ev["terminal_reason"])
+    }
+
+    case ev["usage"] do
+      usage when is_map(usage) -> Map.put(base, :usage, usage)
+      _ -> base
+    end
+  end
+
+  defp build_chunk_meta(_, cli), do: %{provider_meta: cli}
+
+  defp finish_reason_from_terminal("completed"), do: :stop
+  defp finish_reason_from_terminal("max_tokens"), do: :length
+  defp finish_reason_from_terminal("cancelled"), do: :cancelled
+  defp finish_reason_from_terminal("incomplete"), do: :incomplete
+  defp finish_reason_from_terminal(_), do: :unknown
+
+  defp classify_cli_event(%{data: %{"type" => "system", "subtype" => "init"} = ev}) do
+    {:cli_meta,
+     drop_nil(%{
+       cli_session_id: ev["session_id"],
+       cli_api_key_source: ev["apiKeySource"],
+       cli_mcp_servers: ev["mcp_servers"]
+     })}
+  end
+
+  defp classify_cli_event(%{data: %{"type" => "rate_limit_event"} = ev}) do
+    case ev["rate_limit_info"] do
+      info when is_map(info) -> {:cli_meta, %{cli_rate_limit: info}}
+      _ -> :anthropic
+    end
+  end
+
+  defp classify_cli_event(%{data: %{"type" => "result"} = ev}) do
+    {:cli_meta,
+     drop_nil(%{
+       cli_session_id: ev["session_id"],
+       cli_reported_cost_usd: ev["total_cost_usd"],
+       cli_terminal_reason: ev["terminal_reason"],
+       cli_permission_denials: ev["permission_denials"] || [],
+       cli_model_usage_breakdown: ev["modelUsage"]
+     })}
+  end
+
+  defp classify_cli_event(_), do: :anthropic
+
+  defp drop_nil(map) do
+    map
+    |> Enum.reject(fn
+      {_k, nil} -> true
+      {_k, []} -> true
+      _ -> false
+    end)
+    |> Map.new()
   end
 
   @impl ReqLLM.Provider

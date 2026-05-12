@@ -146,14 +146,14 @@ defmodule ReqLLM.Providers.ClaudeAgent.StreamClient do
       :skip ->
         forward_lines(port, pid, rest, state)
 
-      {:terminal, _ev} ->
+      {:forward, line_to_emit} ->
+        safe_event(pid, {:data, sse_chunk(line_to_emit)})
+        forward_lines(port, pid, rest, state)
+
+      {:terminal, line_to_emit} ->
+        safe_event(pid, {:data, sse_chunk(line_to_emit)})
         safe_event(pid, :done)
         %{state | finished?: true}
-
-      {:forward, line_to_emit} ->
-        chunk = sse_chunk(line_to_emit)
-        safe_event(pid, {:data, chunk})
-        forward_lines(port, pid, rest, state)
 
       {:control_request, subtype, request_id, payload} ->
         new_state = handle_control_request(port, state, subtype, request_id, payload)
@@ -185,11 +185,23 @@ defmodule ReqLLM.Providers.ClaudeAgent.StreamClient do
     end
   end
 
+  defp classify_stream_line(%{"type" => "stream_event", "event" => %{"type" => type}}, _line)
+       when type in ["message_stop", "message_delta"],
+       do: :skip
+
   defp classify_stream_line(%{"type" => "stream_event", "event" => event}, _line)
        when is_map(event),
        do: {:forward, Jason.encode!(event)}
 
-  defp classify_stream_line(%{"type" => "result"}, line), do: {:terminal, line}
+  defp classify_stream_line(%{"type" => "system", "subtype" => "init"} = ev, _line),
+    do: {:forward, Jason.encode!(ev)}
+
+  defp classify_stream_line(%{"type" => "rate_limit_event"} = ev, _line),
+    do: {:forward, Jason.encode!(ev)}
+
+  defp classify_stream_line(%{"type" => "result"} = ev, _line),
+    do: {:terminal, Jason.encode!(ev)}
+
   defp classify_stream_line(_, _line), do: :skip
 
   defp handle_control_request(port, state, "mcp_message", request_id, payload) do
