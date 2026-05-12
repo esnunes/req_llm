@@ -78,6 +78,89 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLIInvocationTest do
     end
   end
 
+  describe "event ordering (regression: events were double-reversed)" do
+    test "captured events arrive in chronological order in the synthesized response" do
+      ClaudeAgent.with_fixture("multi_event_text", fn ->
+        {:ok, response} =
+          ReqLLM.generate_text(@model_id, "Hi",
+            provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+          )
+
+        text = ReqLLM.Response.text(response)
+
+        assert text == "first piece second piece",
+               "concatenated content blocks should preserve emission order, got: #{inspect(text)}"
+
+        assert response.provider_meta[:cli_session_id] == "sess-multi-1"
+      end)
+    end
+  end
+
+  describe "exit-status mapping (regression: 1 → 401 conflated auth with all exit-1 errors)" do
+    test "auth-style stderr maps exit 1 to 401" do
+      ClaudeAgent.with_fixture("auth_failure", fn ->
+        {:error, %ReqLLM.Error.API.Request{} = err} =
+          ReqLLM.generate_text(@model_id, "Hi",
+            provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+          )
+
+        assert err.status == 401
+        assert err.response_body =~ "Authentication failure"
+      end)
+    end
+
+    test "generic stderr maps exit 1 to 500 (not the auth-only 401)" do
+      ClaudeAgent.with_fixture("generic_error", fn ->
+        {:error, %ReqLLM.Error.API.Request{} = err} =
+          ReqLLM.generate_text(@model_id, "Hi",
+            provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+          )
+
+        assert err.status == 500
+        assert err.response_body =~ "Internal error"
+      end)
+    end
+
+    test "exit 0 with no result event produces a 502 with a descriptive reason" do
+      ClaudeAgent.with_fixture("exit_0_no_result", fn ->
+        {:error, %ReqLLM.Error.API.Request{} = err} =
+          ReqLLM.generate_text(@model_id, "Hi",
+            provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+          )
+
+        assert err.status == 502
+        assert err.reason =~ "never emitted a terminal `result` event"
+      end)
+    end
+  end
+
+  describe "user-defined tools gating (regression: Tools.advertise was dead code)" do
+    test "passing :tools surfaces a typed NotImplemented before any subprocess work" do
+      {:ok, dummy_tool} =
+        ReqLLM.Tool.new(
+          name: "weather",
+          description: "Get weather",
+          parameter_schema: %{},
+          callback: fn _args -> {:ok, "sunny"} end
+        )
+
+      assert {:error, %ReqLLM.Error.Invalid.NotImplemented{}} =
+               ReqLLM.generate_text(@model_id, "Hi",
+                 tools: [dummy_tool],
+                 provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+               )
+    end
+
+    test ":object operation rejects with NotImplemented (MCP sidecar follow-up)" do
+      schema = [name: [type: :string, required: true]]
+
+      assert {:error, %ReqLLM.Error.Invalid.NotImplemented{}} =
+               ReqLLM.generate_object(@model_id, "give a name", schema,
+                 provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+               )
+    end
+  end
+
   defp capability_cause(%ReqLLM.Error.Invalid.Capability{} = err), do: err
   defp capability_cause(%{cause: %ReqLLM.Error.Invalid.Capability{} = err}), do: err
   defp capability_cause(other), do: other

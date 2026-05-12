@@ -31,7 +31,7 @@ defmodule ReqLLM.Providers.ClaudeAgent do
     id: :claude_agent,
     default_base_url: "claude://local"
 
-  alias ReqLLM.Providers.ClaudeAgent.{CLI, ReqAdapter, Usage}
+  alias ReqLLM.Providers.ClaudeAgent.{CLI, ReqAdapter, Tools, Usage}
 
   @provider_schema [
     allowed_tools: [
@@ -100,6 +100,7 @@ defmodule ReqLLM.Providers.ClaudeAgent do
   def prepare_request(:chat, model_spec, prompt, opts) do
     with {:ok, model} <- ReqLLM.model(model_spec),
          :ok <- validate_model_provider(model),
+         :ok <- Tools.advertise(opts),
          {:ok, context} <- ReqLLM.Context.normalize(prompt, opts),
          opts_with_context = Keyword.put(opts, :context, context),
          {:ok, processed_opts} <-
@@ -130,28 +131,15 @@ defmodule ReqLLM.Providers.ClaudeAgent do
     end
   end
 
-  def prepare_request(:object, model_spec, prompt, opts) do
-    compiled_schema = Keyword.fetch!(opts, :compiled_schema)
-
-    case ReqLLM.Tool.new(
-           name: "structured_output",
-           description: "Emit a JSON object matching the provided schema.",
-           parameter_schema: ReqLLM.Schema.to_json(compiled_schema.schema),
-           strict: true,
-           callback: fn _args -> {:ok, "structured output captured"} end
-         ) do
-      {:ok, tool} ->
-        opts_with_tool =
-          opts
-          |> Keyword.update(:tools, [tool], fn existing -> [tool | existing] end)
-          |> Keyword.put(:tool_choice, %{type: "tool", name: "structured_output"})
-          |> Keyword.put(:operation, :object)
-
-        prepare_request(:chat, model_spec, prompt, opts_with_tool)
-
-      {:error, _} = err ->
-        err
-    end
+  def prepare_request(:object, _model_spec, _prompt, _opts) do
+    {:error,
+     ReqLLM.Error.Invalid.NotImplemented.exception(
+       feature:
+         "generate_object/4 on the :claude_agent provider. The structured-output path " <>
+           "rides on user-defined tools, which need the MCP stdio sidecar to reach the " <>
+           "Claude Code CLI. The sidecar is a follow-up; until then, use :anthropic for " <>
+           "structured output."
+     )}
   end
 
   def prepare_request(operation, _model_spec, _input, _opts) do
@@ -224,10 +212,7 @@ defmodule ReqLLM.Providers.ClaudeAgent do
      )}
   end
 
-  @doc """
-  Streaming transport selector consumed by `ReqLLM.Streaming.start_stream/4`.
-  """
-  @spec stream_transport(LLMDB.Model.t(), keyword()) :: :port
+  @impl ReqLLM.Provider
   def stream_transport(_model, _opts), do: :port
 
   defp anthropic_model_view(%LLMDB.Model{} = model), do: %{model | provider: :anthropic}

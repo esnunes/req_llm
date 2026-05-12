@@ -130,12 +130,19 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
   end
 
   @doc """
-  Write a single JSON event followed by a newline.
+  Write a single JSON event followed by a newline. Returns `:ok` on success or
+  `{:error, :port_closed}` when the port has already exited.
   """
-  @spec write_event(port(), map()) :: true
+  @spec write_event(port(), map()) :: :ok | {:error, :port_closed}
   def write_event(port, event) when is_map(event) do
     line = Jason.encode!(event)
-    Port.command(port, line <> "\n")
+
+    try do
+      Port.command(port, line <> "\n")
+      :ok
+    rescue
+      ArgumentError -> {:error, :port_closed}
+    end
   end
 
   @doc """
@@ -165,12 +172,6 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
     do_read(port, state, deadline)
   end
 
-  defp do_read(_port, %{result: result} = state, _deadline) when not is_nil(result) do
-    state
-    |> Map.put(:events, Enum.reverse(state.events))
-    |> ok()
-  end
-
   defp do_read(port, state, deadline) do
     remaining = remaining_ms(deadline)
 
@@ -192,8 +193,8 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
           state = %{state | exit_status: status}
 
           case state do
-            %{result: nil, diagnostic: diag} ->
-              {:error, {:exit, status, diag}}
+            %{result: nil} ->
+              {:error, {:exit, status, surface_diagnostic(state)}}
 
             %{result: _} ->
               {:ok, Map.update!(state, :events, &Enum.reverse/1)}
@@ -228,12 +229,10 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
       {:event, event} ->
         new_state = handle_event(state, event)
 
-        cond do
-          new_state.result != nil ->
-            {:done, %{new_state | events: Enum.reverse([event | state.events])}}
-
-          true ->
-            process_lines(new_state, rest)
+        if new_state.result != nil do
+          {:done, new_state}
+        else
+          process_lines(new_state, rest)
         end
 
       {:diagnostic, line} ->
@@ -304,7 +303,11 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
     end
   end
 
-  defp ok(state), do: {:ok, state}
+  defp surface_diagnostic(%{diagnostic: diag, diagnostic_truncated?: true}) do
+    "[diagnostic truncated; showing the last 64KB]\n" <> diag
+  end
+
+  defp surface_diagnostic(%{diagnostic: diag}), do: diag
 
   defp safe_close(port) do
     if Port.info(port) != nil do

@@ -85,34 +85,6 @@ defmodule ReqLLM.Providers.ClaudeAgent.Protocol do
     }
   end
 
-  @doc """
-  Encode a tool result so it can be written back on the port's stdin during a
-  tool round-trip.
-  """
-  @spec encode_tool_result(String.t(), term(), boolean()) :: map()
-  def encode_tool_result(tool_use_id, content, is_error?) do
-    encoded =
-      cond do
-        is_binary(content) -> [%{"type" => "text", "text" => content}]
-        true -> [%{"type" => "text", "text" => safe_json(content)}]
-      end
-
-    %{
-      "type" => "user",
-      "message" => %{
-        "role" => "user",
-        "content" => [
-          %{
-            "type" => "tool_result",
-            "tool_use_id" => tool_use_id,
-            "content" => encoded,
-            "is_error" => is_error? == true
-          }
-        ]
-      }
-    }
-  end
-
   # --- internal ---
 
   defp encode_content_from_context(%ReqLLM.Context{messages: messages}) do
@@ -262,11 +234,4 @@ defmodule ReqLLM.Providers.ClaudeAgent.Protocol do
 
   defp normalize_usage(%{"usage" => usage}) when is_map(usage), do: usage
   defp normalize_usage(_), do: %{}
-
-  defp safe_json(value) do
-    case Jason.encode(value) do
-      {:ok, encoded} -> encoded
-      _ -> inspect(value)
-    end
-  end
 end

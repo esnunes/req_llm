@@ -1,0 +1,5 @@
+{"exit_code":0,"stderr":""}
+{"type":"system","subtype":"init","session_id":"sess-multi-1","model":"claude-sonnet-4-5-20250929","tools":[],"mcp_servers":[],"apiKeySource":"none"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":"2026-05-12T18:00:00Z"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first piece"},{"type":"text","text":" second piece"}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"sess-multi-1","terminal_reason":"completed","total_cost_usd":0.0002,"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"permission_denials":[]}

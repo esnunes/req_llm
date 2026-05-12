@@ -61,54 +61,60 @@ defmodule ReqLLM.Providers.ClaudeAgent.StreamClient do
 
   defp run_stream(binary, args, provider_opts, context, stream_server_pid) do
     port = CLI.open_port(binary, args, provider_opts)
+    monitor_ref = Process.monitor(stream_server_pid)
     timeout = Keyword.get(provider_opts, :cli_timeout, 300_000)
     deadline = System.monotonic_time(:millisecond) + timeout
 
+    initial_state = %{buffer: "", finished?: false, monitor_ref: monitor_ref}
+
     try do
-      CLI.write_event(port, Protocol.encode_user_event(context))
+      _ = CLI.write_event(port, Protocol.encode_user_event(context))
       safe_event(stream_server_pid, {:status, 200})
       safe_event(stream_server_pid, {:headers, [{"content-type", "text/event-stream"}]})
 
-      do_pump(port, %{buffer: "", finished?: false}, stream_server_pid, deadline)
+      do_pump(port, initial_state, stream_server_pid, deadline)
     after
+      Process.demonitor(monitor_ref, [:flush])
       CLI.close_port(port)
     end
   end
 
-  defp do_pump(_port, %{finished?: true}, stream_server_pid, _deadline) do
-    safe_event(stream_server_pid, :done)
+  defp do_pump(_port, %{finished?: true}, _stream_server_pid, _deadline) do
     :ok
   end
 
   defp do_pump(port, state, stream_server_pid, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    cond do
-      remaining <= 0 ->
-        safe_event(stream_server_pid, {:error, :timeout})
-        :timeout
+    if remaining <= 0 do
+      safe_event(stream_server_pid, {:error, :timeout})
+      :timeout
+    else
+      monitor_ref = state.monitor_ref
 
-      true ->
-        receive do
-          {^port, {:data, chunk}} ->
-            {state, lines} = accumulate(state, chunk)
-            state = forward_lines(stream_server_pid, lines, state)
-            do_pump(port, state, stream_server_pid, deadline)
+      receive do
+        {^port, {:data, chunk}} ->
+          {state, lines} = accumulate(state, chunk)
+          state = forward_lines(stream_server_pid, lines, state)
+          do_pump(port, state, stream_server_pid, deadline)
 
-          {^port, {:exit_status, status}} ->
-            if state.finished? do
-              :ok
-            else
-              event = if status == 0, do: :done, else: {:error, {:exit, status}}
-              safe_event(stream_server_pid, event)
-            end
-
+        {^port, {:exit_status, status}} ->
+          if state.finished? do
             :ok
-        after
-          remaining ->
-            safe_event(stream_server_pid, {:error, :timeout})
-            :timeout
-        end
+          else
+            event = if status == 0, do: :done, else: {:error, {:exit, status}}
+            safe_event(stream_server_pid, event)
+          end
+
+          :ok
+
+        {:DOWN, ^monitor_ref, :process, ^stream_server_pid, _reason} ->
+          :stream_server_down
+      after
+        remaining ->
+          safe_event(stream_server_pid, {:error, :timeout})
+          :timeout
+      end
     end
   end
 

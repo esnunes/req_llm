@@ -158,4 +158,19 @@ defmodule ReqLLM.Providers.ClaudeAgent.OptionValidationTest do
       assert Enum.at(args, flag_idx + 1) == "plan"
     end
   end
+
+  describe "stream_transport/2 callback" do
+    test "claude_agent selects :port" do
+      {:ok, model} = ReqLLM.model("claude_agent:claude-sonnet-4-5-20250929")
+      assert ClaudeAgent.stream_transport(model, []) == :port
+    end
+
+    test "anthropic provider does NOT select :port (regression: dispatch is provider-scoped)" do
+      refute function_exported?(ReqLLM.Providers.Anthropic, :stream_transport, 2) and
+               ReqLLM.Providers.Anthropic.stream_transport(
+                 %LLMDB.Model{id: "x", provider: :anthropic},
+                 []
+               ) == :port
+    end
+  end
 end

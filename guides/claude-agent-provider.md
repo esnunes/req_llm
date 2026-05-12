@@ -91,11 +91,26 @@ V1 supports the CLI's built-in tools (Read, Bash, Write, WebFetch, …) via
 `:allowed_tools` / `:disallowed_tools`. **User-defined `ReqLLM.Tool` specs
 are not yet wired up** — advertising them to the CLI requires an in-process
 MCP stdio sidecar, which is a follow-up. Until then, passing `:tools` with
-user-defined entries raises `ReqLLM.Error.Invalid.NotImplemented`.
+user-defined entries fails up-front with
+`{:error, %ReqLLM.Error.Invalid.NotImplemented{}}` — no subprocess is
+spawned.
 
-`generate_object/4` follows the same constraint: the provider implements
-the path on top of a forced `structured_output` tool, but until the MCP
-sidecar lands you'll see the same `Invalid.NotImplemented` error.
+`generate_object/4` follows the same constraint and returns the same
+typed `NotImplemented` error. The structured-output path rides on top of
+a forced `structured_output` tool, so it can land at the same time as the
+MCP sidecar.
+
+## Streaming metadata
+
+The non-streaming response surfaces session/CLI metadata under
+`response.provider_meta` (`:cli_session_id`, `:cli_reported_cost_usd`,
+`:cli_terminal_reason`, `:cli_api_key_source`, `:cli_permission_denials`,
+`:cli_mcp_servers`).
+
+The streaming path does **not** yet surface that metadata — the CLI's
+`system/init` and terminal `result` events are consumed but not forwarded
+into the StreamServer's metadata channel. Track this as a follow-up if
+you need session continuity across streaming turns.
 
 ## Known limitations
 

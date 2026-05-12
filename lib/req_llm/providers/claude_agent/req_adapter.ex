@@ -28,7 +28,10 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
       port = CLI.open_port(binary, args, provider_opts)
 
       try do
-        CLI.write_event(port, Protocol.encode_user_event(context))
+        case CLI.write_event(port, Protocol.encode_user_event(context)) do
+          :ok -> :ok
+          {:error, :port_closed} -> :ok
+        end
 
         case CLI.read_to_terminal(port, timeout) do
           {:ok, %{result: result, events: events} = state} ->
@@ -55,10 +58,8 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
           {:error, {:exit, code, diagnostic}} ->
             {req,
              ReqLLM.Error.API.Request.exception(
-               reason:
-                 "Claude Code CLI exited with status #{code}." <>
-                   if(diagnostic == "", do: "", else: " stderr: " <> diagnostic),
-               status: error_status_for_exit(code),
+               reason: build_exit_reason(code, diagnostic),
+               status: error_status_for(code, diagnostic),
                response_body: diagnostic
              )}
 
@@ -89,8 +90,36 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
   defp status_for_result(%{"subtype" => "error"}), do: 500
   defp status_for_result(_), do: 200
 
-  defp error_status_for_exit(1), do: 401
-  defp error_status_for_exit(_), do: 500
+  defp error_status_for(0, _diagnostic), do: 502
+
+  defp error_status_for(_code, diagnostic) when is_binary(diagnostic) do
+    cond do
+      auth_diagnostic?(diagnostic) -> 401
+      true -> 500
+    end
+  end
+
+  defp error_status_for(_code, _diagnostic), do: 500
+
+  defp auth_diagnostic?(diagnostic) do
+    lower = String.downcase(diagnostic)
+
+    String.contains?(lower, "authentication failure") or
+      String.contains?(lower, "unauthorized") or
+      String.contains?(lower, "claude auth login") or
+      String.contains?(lower, "not authenticated") or
+      String.contains?(lower, "anthropic_api_key")
+  end
+
+  defp build_exit_reason(0, diagnostic) do
+    base = "Claude Code CLI exited cleanly but never emitted a terminal `result` event."
+    if diagnostic == "" or is_nil(diagnostic), do: base, else: base <> " stderr: " <> diagnostic
+  end
+
+  defp build_exit_reason(code, diagnostic) do
+    base = "Claude Code CLI exited with status #{code}."
+    if diagnostic == "" or is_nil(diagnostic), do: base, else: base <> " stderr: " <> diagnostic
+  end
 
   defp build_headers(state, binary) do
     sid = state.session_id

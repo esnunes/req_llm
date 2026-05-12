@@ -746,6 +746,7 @@ defmodule ReqLLM.Providers.OpenAI do
     ReqLLM.Providers.OpenAI.WebSocket.start_responses_session(model, opts)
   end
 
+  @impl ReqLLM.Provider
   def stream_transport(_model, opts) do
     provider_opts = Keyword.get(opts, :provider_options, [])
 

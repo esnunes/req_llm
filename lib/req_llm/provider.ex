@@ -621,6 +621,27 @@ defmodule ReqLLM.Provider do
   """
   @callback credential_missing?(Exception.t()) :: boolean()
 
+  @doc """
+  Selects the streaming transport ReqLLM.Streaming should use for this provider.
+
+  Default (when not implemented) is `:http`, which dispatches to the Finch-based
+  client. Providers that need a different transport — for example, the Claude
+  Code CLI provider, which streams over a `Port` — implement this callback to
+  return `:port` (or another future transport id).
+
+  Returning a transport that `ReqLLM.Streaming.start_transport_streaming/6` does
+  not know about will surface as a `{:error, ...}` from the streaming pipeline.
+
+  ## Examples
+
+      # HTTP streaming (default — usually unnecessary to implement)
+      def stream_transport(_model, _opts), do: :http
+
+      # Port-based streaming (Claude Code CLI)
+      def stream_transport(_model, _opts), do: :port
+  """
+  @callback stream_transport(LLMDB.Model.t(), keyword()) :: atom()
+
   @optional_callbacks [
     normalize_model_id: 1,
     extract_usage: 2,
@@ -637,7 +658,8 @@ defmodule ReqLLM.Provider do
     thinking_constraints: 0,
     credential_missing?: 1,
     oauth_provider_id: 0,
-    refresh_oauth_credentials: 2
+    refresh_oauth_credentials: 2,
+    stream_transport: 2
   ]
 
   defmacro __before_compile__(_env) do
