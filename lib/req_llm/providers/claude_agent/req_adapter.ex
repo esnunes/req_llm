@@ -8,7 +8,7 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
   ReqLLM pipeline (decode/usage/telemetry) can consume unchanged.
   """
 
-  alias ReqLLM.Providers.ClaudeAgent.{CLI, Protocol}
+  alias ReqLLM.Providers.ClaudeAgent.{CLI, Control, Protocol, Tools}
 
   @doc """
   Adapter entry point. Returns `{request, response_or_error}` per the Req
@@ -22,53 +22,27 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
     context = req.options[:context]
     timeout = Keyword.get(provider_opts, :cli_timeout, 120_000)
 
+    tools_opts =
+      provider_opts
+      |> Keyword.put_new(:tools, req.options[:tools])
+
     with {:ok, binary} <- CLI.resolve_binary(provider_opts),
          :ok <- CLI.verify_version(binary, provider_opts),
+         {:ok, tools_state} <- Tools.prepare(tools_opts),
          args <- CLI.build_args(model, provider_opts) do
       port = CLI.open_port(binary, args, provider_opts)
 
       try do
-        case CLI.write_event(port, Protocol.encode_user_event(context)) do
-          :ok -> :ok
-          {:error, :port_closed} -> :ok
+        if Tools.advertise?(tools_state) do
+          {_id, init_event} =
+            Control.initialize_request(Control.new_request_id(), [Tools.server_name()])
+
+          _ = CLI.write_event(port, init_event)
         end
 
-        case CLI.read_to_terminal(port, timeout) do
-          {:ok, %{result: result, events: events} = state} ->
-            init_event = find_init_event(events)
-            body = Protocol.synthesize_response_body(events, result, init_event)
-            status = status_for_result(result)
+        _ = CLI.write_event(port, Protocol.encode_user_event(context))
 
-            response = %Req.Response{
-              status: status,
-              headers: build_headers(state, binary),
-              body: body,
-              private: %{}
-            }
-
-            {req, response}
-
-          {:error, :timeout} ->
-            {req,
-             ReqLLM.Error.API.Request.exception(
-               reason: :timeout,
-               status: 504
-             )}
-
-          {:error, {:exit, code, diagnostic}} ->
-            {req,
-             ReqLLM.Error.API.Request.exception(
-               reason: build_exit_reason(code, diagnostic),
-               status: error_status_for(code, diagnostic),
-               response_body: diagnostic
-             )}
-
-          {:error, other} ->
-            {req,
-             ReqLLM.Error.API.Response.exception(
-               reason: "Claude Code CLI protocol error: #{inspect(other)}"
-             )}
-        end
+        handle_read(req, port, timeout, tools_state, binary)
       after
         CLI.close_port(port)
       end
@@ -77,6 +51,50 @@ defmodule ReqLLM.Providers.ClaudeAgent.ReqAdapter do
       {:error, other} -> {req, ReqLLM.Error.Unknown.Unknown.exception(error: other)}
     end
   end
+
+  defp handle_read(req, port, timeout, tools_state, binary) do
+    case CLI.read_to_terminal(port, timeout, tools_state) do
+      {:ok, %{result: result, events: events} = state} ->
+        init_event = find_init_event(events)
+        body = Protocol.synthesize_response_body(events, result, init_event)
+        status = status_for_result(result)
+
+        response = %Req.Response{
+          status: status,
+          headers: build_headers(state, binary),
+          body: body,
+          private: %{
+            tool_errors: tool_errors(state.tools_state)
+          }
+        }
+
+        {req, response}
+
+      {:error, :timeout} ->
+        {req,
+         ReqLLM.Error.API.Request.exception(
+           reason: :timeout,
+           status: 504
+         )}
+
+      {:error, {:exit, code, diagnostic}} ->
+        {req,
+         ReqLLM.Error.API.Request.exception(
+           reason: build_exit_reason(code, diagnostic),
+           status: error_status_for(code, diagnostic),
+           response_body: diagnostic
+         )}
+
+      {:error, other} ->
+        {req,
+         ReqLLM.Error.API.Response.exception(
+           reason: "Claude Code CLI protocol error: #{inspect(other)}"
+         )}
+    end
+  end
+
+  defp tool_errors(%Tools.State{errors: errors}), do: Enum.reverse(errors)
+  defp tool_errors(_), do: []
 
   defp find_init_event(events) do
     Enum.find(events, fn

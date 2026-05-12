@@ -149,10 +149,18 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
   Read from the port until either a terminal `result` event arrives or the
   port exits. Returns a map describing the stream collected events, the
   terminal result (if any), any diagnostic buffer, and the exit status.
+
+  When `tools_state` is non-nil, inbound `control_request` messages of
+  subtype `mcp_message` are dispatched against the registered tools and
+  the resulting `control_response` is written back on the port. The
+  updated tools state is included on the return map under `:tools_state`.
   """
-  @spec read_to_terminal(port(), pos_integer()) ::
-          {:ok, map()} | {:error, term()}
-  def read_to_terminal(port, timeout_ms) do
+  @spec read_to_terminal(
+          port(),
+          pos_integer(),
+          ReqLLM.Providers.ClaudeAgent.Tools.State.t() | nil
+        ) :: {:ok, map()} | {:error, term()}
+  def read_to_terminal(port, timeout_ms, tools_state \\ nil) do
     deadline = monotonic_deadline(timeout_ms)
 
     state = %{
@@ -166,7 +174,8 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
       permission_denials: [],
       rate_limit: nil,
       mcp_servers: [],
-      exit_status: nil
+      exit_status: nil,
+      tools_state: tools_state
     }
 
     do_read(port, state, deadline)
@@ -183,9 +192,9 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
         {^port, {:data, chunk}} ->
           {state, lines} = accumulate(state, chunk)
 
-          case process_lines(state, lines) do
+          case process_lines(port, state, lines) do
             {:cont, state} -> do_read(port, state, deadline)
-            {:done, state} -> {:ok, Map.update!(state, :events, &Enum.reverse/1)}
+            {:done, state} -> {:ok, finalize_events(state)}
             {:error, _} = err -> err
           end
 
@@ -197,7 +206,7 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
               {:error, {:exit, status, surface_diagnostic(state)}}
 
             %{result: _} ->
-              {:ok, Map.update!(state, :events, &Enum.reverse/1)}
+              {:ok, finalize_events(state)}
           end
       after
         remaining ->
@@ -205,6 +214,62 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
           {:error, :timeout}
       end
     end
+  end
+
+  @doc """
+  Wait for a single inbound `control_response` matching `request_id` on
+  the port. Used to gate the initialize handshake. Returns `:ok` on
+  success, `{:error, reason}` on failure. Does not consume stream-json
+  events — if any arrive before the response, they're buffered and
+  re-played on the next `read_to_terminal/3` call via the returned
+  state.
+  """
+  @spec await_control_response(port(), String.t(), pos_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def await_control_response(port, request_id, timeout_ms) do
+    deadline = monotonic_deadline(timeout_ms)
+    do_await_response(port, request_id, deadline, "")
+  end
+
+  defp do_await_response(port, request_id, deadline, buffer) do
+    remaining = remaining_ms(deadline)
+
+    if remaining <= 0 do
+      {:error, :timeout}
+    else
+      receive do
+        {^port, {:data, chunk}} ->
+          combined = buffer <> chunk
+          parts = String.split(combined, "\n")
+          {complete, [tail]} = Enum.split(parts, length(parts) - 1)
+
+          case scan_for_response(complete, request_id) do
+            {:found, response} -> {:ok, response}
+            :not_found -> do_await_response(port, request_id, deadline, tail)
+          end
+
+        {^port, {:exit_status, status}} ->
+          {:error, {:exit, status}}
+      after
+        remaining -> {:error, :timeout}
+      end
+    end
+  end
+
+  defp scan_for_response([], _request_id), do: :not_found
+
+  defp scan_for_response([line | rest], request_id) do
+    with {:ok, decoded} <- Jason.decode(line),
+         {:response, _subtype, ^request_id, payload} <-
+           ReqLLM.Providers.ClaudeAgent.Control.classify(decoded) do
+      {:found, payload}
+    else
+      _ -> scan_for_response(rest, request_id)
+    end
+  end
+
+  defp finalize_events(state) do
+    Map.update!(state, :events, &Enum.reverse/1)
   end
 
   @doc false
@@ -219,12 +284,12 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
     {%{state | buffer: tail}, complete}
   end
 
-  defp process_lines(state, []), do: {:cont, state}
+  defp process_lines(_port, state, []), do: {:cont, state}
 
-  defp process_lines(state, [line | rest]) do
+  defp process_lines(port, state, [line | rest]) do
     case classify_line(line) do
       :ignore ->
-        process_lines(state, rest)
+        process_lines(port, state, rest)
 
       {:event, event} ->
         new_state = handle_event(state, event)
@@ -232,11 +297,18 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
         if new_state.result != nil do
           {:done, new_state}
         else
-          process_lines(new_state, rest)
+          process_lines(port, new_state, rest)
         end
 
+      {:control_request, subtype, request_id, payload} ->
+        new_state = handle_control_request(port, state, subtype, request_id, payload)
+        process_lines(port, new_state, rest)
+
+      {:control_response, _subtype, _id, _payload} ->
+        process_lines(port, state, rest)
+
       {:diagnostic, line} ->
-        process_lines(append_diagnostic(state, line), rest)
+        process_lines(port, append_diagnostic(state, line), rest)
     end
   end
 
@@ -244,21 +316,65 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLI do
 
   defp classify_line(line) do
     case Jason.decode(line) do
-      {:ok, %{"type" => type} = event}
-      when is_binary(type) and
-             type in [
-               "system",
-               "assistant",
-               "user",
-               "stream_event",
-               "rate_limit_event",
-               "result"
-             ] ->
-        {:event, event}
+      {:ok, decoded} ->
+        case ReqLLM.Providers.ClaudeAgent.Control.classify(decoded) do
+          {:request, subtype, request_id, payload} ->
+            {:control_request, subtype, request_id, payload}
+
+          {:response, subtype, request_id, payload} ->
+            {:control_response, subtype, request_id, payload}
+
+          :not_control ->
+            classify_stream_event(decoded, line)
+        end
 
       _ ->
         {:diagnostic, line}
     end
+  end
+
+  @stream_event_types ~w(system assistant user stream_event rate_limit_event result)
+
+  defp classify_stream_event(%{"type" => type} = event, _line)
+       when is_binary(type) and type in @stream_event_types,
+       do: {:event, event}
+
+  defp classify_stream_event(_event, line), do: {:diagnostic, line}
+
+  defp handle_control_request(port, state, "mcp_message", request_id, payload) do
+    case state.tools_state do
+      %ReqLLM.Providers.ClaudeAgent.Tools.State{} = tools ->
+        {response, new_tools} =
+          ReqLLM.Providers.ClaudeAgent.Tools.dispatch_mcp(request_id, payload, tools)
+
+        _ = write_event(port, response)
+        %{state | tools_state: new_tools}
+
+      _ ->
+        _ =
+          write_event(
+            port,
+            ReqLLM.Providers.ClaudeAgent.Control.mcp_error_response(
+              request_id,
+              "No tools registered"
+            )
+          )
+
+        state
+    end
+  end
+
+  defp handle_control_request(port, state, _subtype, request_id, _payload) do
+    _ =
+      write_event(
+        port,
+        ReqLLM.Providers.ClaudeAgent.Control.mcp_error_response(
+          request_id,
+          "Control subtype not implemented"
+        )
+      )
+
+    state
   end
 
   defp handle_event(state, event) do

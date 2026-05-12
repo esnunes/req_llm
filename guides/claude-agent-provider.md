@@ -87,18 +87,44 @@ response.provider_meta[:cli_reported_cost_usd] # CLI's view
 
 ## Tool use
 
-V1 supports the CLI's built-in tools (Read, Bash, Write, WebFetch, …) via
-`:allowed_tools` / `:disallowed_tools`. **User-defined `ReqLLM.Tool` specs
-are not yet wired up** — advertising them to the CLI requires an in-process
-MCP stdio sidecar, which is a follow-up. Until then, passing `:tools` with
-user-defined entries fails up-front with
-`{:error, %ReqLLM.Error.Invalid.NotImplemented{}}` — no subprocess is
-spawned.
+V1 supports both **built-in CLI tools** (Read, Bash, Write, WebFetch, …)
+via `:allowed_tools` / `:disallowed_tools`, and **user-defined
+`ReqLLM.Tool` specs** via the CLI's bidirectional control protocol.
 
-`generate_object/4` follows the same constraint and returns the same
-typed `NotImplemented` error. The structured-output path rides on top of
-a forced `structured_output` tool, so it can land at the same time as the
-MCP sidecar.
+User-defined tools are advertised as an *in-process SDK MCP server*: at
+session start the provider sends an `initialize` control_request with the
+server name `req-llm-tools` so the CLI knows the server lives in our BEAM
+node. When the model emits a `tool_use` block targeting
+`mcp__req-llm-tools__<tool-name>`, the CLI sends a JSON-RPC `tools/call`
+back to us over stdin; we dispatch to the matching `ReqLLM.Tool`
+callback in-process and reply with a `control_response` carrying the
+result. No subprocess, no socket, no MCP sidecar — just the same stdin
+already in play for stream-json events.
+
+```elixir
+{:ok, weather} =
+  ReqLLM.Tool.new(
+    name: "weather",
+    description: "Get the weather in a city.",
+    parameter_schema: [city: [type: :string, required: true]],
+    callback: fn args -> {:ok, "sunny in #{args[:city]}"} end
+  )
+
+{:ok, response} =
+  ReqLLM.generate_text("claude_agent:claude-sonnet-4-5-20250929",
+    "What's the weather in Paris?",
+    tools: [weather])
+```
+
+`generate_object/4` rides the same channel: the provider forces a
+`structured_output` tool whose `parameter_schema` is the caller's Zoi
+schema, lets the CLI invoke it, and exposes the captured args as
+`response.object`.
+
+Caller-side tool errors (`{:error, reason}` from the callback) surface
+as MCP `isError: true` to the model and accumulate under
+`response.private[:tool_errors]` so the caller can inspect what went
+wrong without crashing the request.
 
 ## Streaming metadata
 

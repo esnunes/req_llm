@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code CLI (`claude` binary) so callers can spend their Claude
   Pro/Max/Team subscription instead of API credits. Reuses the existing
   Anthropic model catalog under `claude_agent:<model-id>`. Supports
-  `generate_text/3`, `stream_text/3`, and the CLI's built-in tools via
-  `:allowed_tools` / `:disallowed_tools`. User-defined `ReqLLM.Tool`
-  advertisement via an MCP stdio sidecar is a follow-up. See
+  `generate_text/3`, `stream_text/3`, `generate_object/4`, the CLI's
+  built-in tools via `:allowed_tools` / `:disallowed_tools`, and
+  user-defined `ReqLLM.Tool` specs via the CLI's bidirectional control
+  protocol (in-process SDK MCP server — no subprocess sidecar). See
   `guides/claude-agent-provider.md`.
 
 <!-- changelog -->

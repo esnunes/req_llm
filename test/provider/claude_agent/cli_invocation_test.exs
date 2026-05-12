@@ -134,30 +134,64 @@ defmodule ReqLLM.Providers.ClaudeAgent.CLIInvocationTest do
     end
   end
 
-  describe "user-defined tools gating (regression: Tools.advertise was dead code)" do
-    test "passing :tools surfaces a typed NotImplemented before any subprocess work" do
-      {:ok, dummy_tool} =
-        ReqLLM.Tool.new(
-          name: "weather",
-          description: "Get weather",
-          parameter_schema: %{},
-          callback: fn _args -> {:ok, "sunny"} end
-        )
+  describe "user-defined tools wiring (control-protocol path)" do
+    test "passing :tools sends an initialize control_request before the user prompt" do
+      ClaudeAgent.with_fixture("basic_text", fn ->
+        {:ok, weather} =
+          ReqLLM.Tool.new(
+            name: "weather",
+            description: "Get weather",
+            parameter_schema: [city: [type: :string, required: true]],
+            callback: fn args -> {:ok, "sunny in #{args[:city]}"} end
+          )
 
-      assert {:error, %ReqLLM.Error.Invalid.NotImplemented{}} =
-               ReqLLM.generate_text(@model_id, "Hi",
-                 tools: [dummy_tool],
-                 provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
-               )
+        assert {:ok, response} =
+                 ReqLLM.generate_text(@model_id, "Hi",
+                   tools: [weather],
+                   provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+                 )
+
+        assert ReqLLM.Response.text(response) == "Hi there!"
+      end)
     end
 
-    test ":object operation rejects with NotImplemented (MCP sidecar follow-up)" do
-      schema = [name: [type: :string, required: true]]
+    test ":object operation routes through the structured_output tool path" do
+      ClaudeAgent.with_fixture("basic_text", fn ->
+        schema = [name: [type: :string, required: true]]
 
-      assert {:error, %ReqLLM.Error.Invalid.NotImplemented{}} =
-               ReqLLM.generate_object(@model_id, "give a name", schema,
-                 provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
-               )
+        assert {:ok, _response} =
+                 ReqLLM.generate_object(@model_id, "give a name", schema,
+                   provider_options: [claude_binary: ClaudeAgent.fake_cli_path()]
+                 )
+      end)
+    end
+
+    test "round-trip: CLI invokes a registered tool and we respond with the callback's result" do
+      ClaudeAgent.with_fixture("basic_text", [version: "2.1.119"], fn ->
+        callback_args = self()
+
+        {:ok, weather} =
+          ReqLLM.Tool.new(
+            name: "weather",
+            description: "Get weather",
+            parameter_schema: [city: [type: :string, required: true]],
+            callback: fn args ->
+              send(callback_args, {:tool_invoked, args})
+              {:ok, "sunny in #{args[:city] || args["city"]}"}
+            end
+          )
+
+        assert {:ok, response} =
+                 ReqLLM.generate_text(@model_id, "Weather in Paris?",
+                   tools: [weather],
+                   provider_options: [claude_binary: ClaudeAgent.fake_tools_cli_path()]
+                 )
+
+        assert_received {:tool_invoked, args}
+        assert (args[:city] || args["city"]) == "Paris"
+        assert ReqLLM.Response.text(response) == "It is sunny in Paris."
+        assert response.provider_meta[:cli_session_id] == "sess-tools-1"
+      end)
     end
   end
 

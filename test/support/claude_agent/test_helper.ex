@@ -5,14 +5,24 @@ defmodule ReqLLM.Test.ClaudeAgent do
   """
 
   @fake_cli Path.expand("../../../test/support/claude_agent/fake_cli.sh", __DIR__)
+  @fake_tools_cli Path.expand("../../../test/support/claude_agent/fake_tools_cli.sh", __DIR__)
   @fixtures_dir Path.expand("../../../test/support/claude_agent/fixtures", __DIR__)
 
   @doc """
-  Absolute path to the bundled fake `claude` binary.
+  Absolute path to the bundled fake `claude` binary (fixture-replay mode).
   """
   @spec fake_cli_path() :: String.t()
   def fake_cli_path do
     @fake_cli
+  end
+
+  @doc """
+  Absolute path to the interactive fake `claude` binary that exercises the
+  control-protocol tool round-trip.
+  """
+  @spec fake_tools_cli_path() :: String.t()
+  def fake_tools_cli_path do
+    @fake_tools_cli
   end
 
   @doc """
